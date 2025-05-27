@@ -58,3 +58,6 @@ app.py
 *.py3z
 __pycache__/
 
+screenpipe-app-tauri/src-tauri/ui_monitor-*
+screenpipe-vision/bin/ui_monitor-*
+screenpipe-vision/bin/ui_monitor
