@@ -19,6 +19,8 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use std::path::Path;
+use image::io::Reader as ImageReader;
 
 pub(crate) const MAX_FPS: f64 = 30.0; // Adjust based on your needs
 const MAX_QUEUE_SIZE: usize = 30; // Increased from 10 for more buffer room
@@ -49,6 +51,7 @@ impl VideoCapture {
         include_list: &[String],
         languages: Vec<Language>,
         capture_unfocused_windows: bool,
+        hide_window_texts: bool,
     ) -> Self {
         let fps = if fps.is_finite() && fps > 0.0 {
             fps
@@ -243,6 +246,7 @@ impl VideoCapture {
                 new_chunk_callback_clone,
                 monitor_id,
                 video_chunk_duration,
+                hide_window_texts,
             )
             .await
             {
@@ -412,6 +416,7 @@ async fn save_frames_as_video(
     new_chunk_callback: Arc<dyn Fn(&str) + Send + Sync>,
     monitor_id: u32,
     video_chunk_duration: Duration,
+    hide_window_texts: bool,
 ) -> Result<(), anyhow::Error> {
     info!(
         "Starting save_frames_as_video function for monitor {}",

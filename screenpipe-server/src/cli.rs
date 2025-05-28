@@ -9,6 +9,8 @@ use clap::ValueEnum;
 use screenpipe_core::Language;
 use screenpipe_db::OcrEngine as DBOcrEngine;
 use screenpipe_db::CustomOcrConfig as DBCustomOcrConfig;
+use std::collections::HashSet;
+
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum CliAudioTranscriptionEngine {
     #[clap(name = "deepgram")]
@@ -284,6 +286,10 @@ pub struct Cli {
     /// Enable pipe functionality (default: false)
     #[arg(long, default_value_t = false)]
     pub enable_pipe_manager: bool,
+
+    /// Comma-separated list of keywords; if any window OCR/text contains one, suppress from pipes/AI (but still archive locally)
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub hide_window_texts: Vec<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,

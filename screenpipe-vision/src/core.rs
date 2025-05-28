@@ -116,6 +116,8 @@ pub struct WindowOcrResult {
     pub focused: bool,
     pub confidence: f64,
     pub browser_url: Option<String>,
+    /// True if this window/frame should be suppressed in output pipes/AI due to forbidden keywords
+    pub suppressed: bool,
 }
 
 pub struct OcrTaskData {
@@ -291,7 +293,7 @@ async fn process_max_average_frame(
         result_tx: max_avg_frame.result_tx,
     };
 
-    if let Err(e) = process_ocr_task(ocr_task_data, ocr_engine, languages).await {
+    if let Err(e) = process_ocr_task(ocr_task_data, ocr_engine, languages, &[]).await {
         error!("Error processing OCR task: {}", e);
         return Err(ContinuousCaptureError::ErrorProcessingOcr(e.to_string()));
     }
@@ -309,10 +311,35 @@ pub struct MaxAverageFrame {
     pub average: f64,
 }
 
+/// Returns true if any forbidden keyword is present in the text (case-insensitive, whole word/phrase match)
+pub fn contains_forbidden_keyword(text: &str, forbidden_keywords: &[String]) -> bool {
+    let text_lower = text.to_lowercase();
+    for keyword in forbidden_keywords {
+        let keyword_lower = keyword.to_lowercase();
+        if keyword_lower.is_empty() { continue; }
+        // Whole word/phrase match (not substring inside another word)
+        let mut search_start_index = 0;
+        while let Some(found_pos_in_substring) = text_lower[search_start_index..].find(&keyword_lower) {
+            let match_start_abs = search_start_index + found_pos_in_substring;
+            let match_end_abs = match_start_abs + keyword_lower.len();
+            let char_before_is_boundary = match_start_abs == 0 ||
+                !text_lower.as_bytes().get(match_start_abs - 1).map_or(false, |&b| (b as char).is_alphanumeric());
+            let char_after_is_boundary = match_end_abs == text_lower.len() ||
+                !text_lower.as_bytes().get(match_end_abs).map_or(false, |&b| (b as char).is_alphanumeric());
+            if char_before_is_boundary && char_after_is_boundary {
+                return true;
+            }
+            search_start_index = match_start_abs + 1;
+        }
+    }
+    false
+}
+
 pub async fn process_ocr_task(
     ocr_task_data: OcrTaskData,
     ocr_engine: &OcrEngine,
     languages: Vec<Language>,
+    forbidden_keywords: &[String],
 ) -> Result<(), ContinuousCaptureError> {
     let OcrTaskData {
         image,
@@ -343,6 +370,13 @@ pub async fn process_ocr_task(
         .await
         .map_err(|e| ContinuousCaptureError::ErrorProcessingOcr(e.to_string()))?;
 
+        // Check for forbidden keywords in OCR text
+        let suppressed = contains_forbidden_keyword(&ocr_result.text, forbidden_keywords);
+        let mut ocr_result = ocr_result;
+        ocr_result.suppressed = suppressed;
+        if suppressed {
+            debug!("Suppressed window for output pipes/AI: {} {}", ocr_result.app_name, ocr_result.window_name);
+        }
         window_ocr_results.push(ocr_result);
     }
 
@@ -403,6 +437,7 @@ async fn process_window_ocr(
         focused: captured_window.is_focused,
         confidence: confidence.unwrap_or(0.0),
         browser_url,
+        suppressed: false,
     })
 }
 
