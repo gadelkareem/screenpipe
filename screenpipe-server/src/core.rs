@@ -241,14 +241,27 @@ async fn record_video(
 
             for window_result in &frame.window_ocr_results {
                 let insert_frame_start = std::time::Instant::now();
+
+                // Determine if this specific window_result should be hidden from pipes
+                let window_is_hidden_from_pipes = if !hide_window_texts.is_empty() {
+                    window_result.suppressed // Use the suppressed flag from the vision part
+                } else {
+                    false
+                };
+
+                if window_is_hidden_from_pipes {
+                    info!("Marking frame entry for window '{}' as hidden from pipes.", window_result.window_name);
+                }
+
                 let result = db
                     .insert_frame(
                         &device_name,
-                        None,
+                        None, // timestamp for the frame row, if different from overall CaptureResult
                         window_result.browser_url.as_deref(),
                         Some(window_result.app_name.as_str()),
                         Some(window_result.window_name.as_str()),
                         window_result.focused,
+                        window_is_hidden_from_pipes, // Pass the window-specific flag
                     )
                     .await;
 
