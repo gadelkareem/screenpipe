@@ -713,6 +713,7 @@ async fn main() -> anyhow::Result<()> {
                     &cli.included_windows,
                     languages_clone.clone(),
                     cli.capture_unfocused_windows,
+                    cli.hide_window_texts.clone(),
                     cli.enable_realtime_audio_transcription,
                 );
 

@@ -9,7 +9,6 @@ use clap::ValueEnum;
 use screenpipe_core::Language;
 use screenpipe_db::OcrEngine as DBOcrEngine;
 use screenpipe_db::CustomOcrConfig as DBCustomOcrConfig;
-use std::collections::HashSet;
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum CliAudioTranscriptionEngine {
