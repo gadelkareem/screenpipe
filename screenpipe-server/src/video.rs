@@ -6,6 +6,7 @@ use screenpipe_vision::monitor::get_monitor_by_id;
 use screenpipe_vision::{
     capture_screenshot_by_window::WindowFilters, continuous_capture, CaptureResult, OcrEngine,
 };
+use screenpipe_vision::core::WindowOcrResult;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -19,9 +20,33 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
+use image::DynamicImage;
+use image::ImageError;
+use std::sync::OnceLock;
 
 pub(crate) const MAX_FPS: f64 = 30.0; // Adjust based on your needs
 const MAX_QUEUE_SIZE: usize = 30; // Increased from 10 for more buffer room
+
+// Static variable to hold the loaded blocked.png image
+static BLOCKED_PNG_IMAGE: OnceLock<Result<DynamicImage, ImageError>> = OnceLock::new();
+
+fn load_blocked_png_once() -> &'static Result<DynamicImage, ImageError> {
+    BLOCKED_PNG_IMAGE.get_or_init(|| {
+        // Assuming "blocked.png" is in the same directory as the executable or a known path
+        // Adjust the path as necessary.
+        // For now, let's assume it's in the current working directory or accessible via a relative path.
+        // A more robust solution would use an environment variable or a configuration setting.
+        let path = "blocked.png";
+        match image::open(path) {
+            Ok(img) => Ok(img),
+            Err(e) => {
+                error!("Failed to load blocked.png from path '{}': {}. Please ensure it exists.", path, e);
+                // Return a placeholder small black image if blocked.png is not found
+                Ok(DynamicImage::new_rgb8(100, 100))
+            }
+        }
+    })
+}
 
 pub struct VideoCapture {
     #[allow(unused)]
@@ -49,6 +74,7 @@ impl VideoCapture {
         include_list: &[String],
         languages: Vec<Language>,
         capture_unfocused_windows: bool,
+        hide_window_texts: Vec<String>,
     ) -> Self {
         let fps = if fps.is_finite() && fps > 0.0 {
             fps
@@ -243,6 +269,7 @@ impl VideoCapture {
                 new_chunk_callback_clone,
                 monitor_id,
                 video_chunk_duration,
+                hide_window_texts.clone(),
             )
             .await
             {
@@ -412,6 +439,7 @@ async fn save_frames_as_video(
     new_chunk_callback: Arc<dyn Fn(&str) + Send + Sync>,
     monitor_id: u32,
     video_chunk_duration: Duration,
+    hide_window_texts: Vec<String>,
 ) -> Result<(), anyhow::Error> {
     info!(
         "Starting save_frames_as_video function for monitor {}",
@@ -442,8 +470,12 @@ async fn save_frames_as_video(
 
             frame_count = 0;
             debug!("Waiting for first frame for monitor {}", monitor_id);
-            let first_frame = wait_for_first_frame(frame_queue).await;
-            let buffer = encode_frame(&first_frame);
+            let first_frame_capture_result = wait_for_first_frame(frame_queue).await;
+            let buffer = encode_frame(
+                &first_frame_capture_result.image,
+                &first_frame_capture_result.window_ocr_results,
+                &hide_window_texts,
+            );
             debug!("Got first frame for new chunk for monitor {}", monitor_id);
 
             let output_file = create_output_file(output_path, monitor_id);
@@ -511,6 +543,7 @@ async fn save_frames_as_video(
             &mut frame_count,
             frames_per_video,
             fps,
+            &hide_window_texts,
         )
         .await;
 
@@ -537,10 +570,41 @@ async fn wait_for_first_frame(
     }
 }
 
-fn encode_frame(frame: &CaptureResult) -> Vec<u8> {
+fn encode_frame(
+    frame_image: &DynamicImage,
+    window_ocr_results: &[WindowOcrResult],
+    hide_window_texts_keywords: &[String],
+) -> Vec<u8> {
     let mut buffer = Vec::new();
-    frame
-        .image
+    let mut use_blocked_image = false;
+
+    if !hide_window_texts_keywords.is_empty() {
+        for ocr_result in window_ocr_results {
+            if ocr_result.suppressed {
+                use_blocked_image = true;
+                break;
+            }
+        }
+    }
+
+    let image_to_encode = if use_blocked_image {
+        match load_blocked_png_once() {
+            Ok(blocked_img) => {
+                info!("Substituting frame with blocked.png due to suppressed content.");
+                blocked_img // Use the successfully loaded (or placeholder) blocked image
+            }
+            Err(_) => {
+                // This case should ideally not be reached if load_blocked_png_once always returns Ok
+                // (even if it's a placeholder on error). Logging error just in case.
+                error!("Blocked.png was expected but failed to load previously, using original frame as fallback.");
+                frame_image // Fallback to original if somehow load_blocked_png_once returned Err
+            }
+        }
+    } else {
+        frame_image
+    };
+
+    image_to_encode
         .write_to(&mut std::io::Cursor::new(&mut buffer), ImageFormat::Png)
         .expect("Failed to encode frame");
     buffer
@@ -571,11 +635,16 @@ async fn process_frames(
     frame_count: &mut usize,
     frames_per_video: usize,
     fps: f64,
+    hide_window_texts: &[String],
 ) {
     let write_timeout = Duration::from_secs_f64(1.0 / fps);
     while *frame_count < frames_per_video {
-        if let Some(frame) = frame_queue.pop() {
-            let buffer = encode_frame(&frame);
+        if let Some(frame_capture_result) = frame_queue.pop() {
+            let buffer = encode_frame(
+                &frame_capture_result.image,
+                &frame_capture_result.window_ocr_results,
+                hide_window_texts,
+            );
             if let Some(stdin) = current_stdin.as_mut() {
                 if let Err(e) = write_frame_with_retry(stdin, &buffer).await {
                     error!("Failed to write frame to ffmpeg after max retries: {}", e);

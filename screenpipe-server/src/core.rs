@@ -27,6 +27,7 @@ pub async fn start_continuous_recording(
     include_windows: &[String],
     languages: Vec<Language>,
     capture_unfocused_windows: bool,
+    hide_window_texts: Vec<String>,
     realtime_vision: bool,
 ) -> Result<()> {
     info!("Starting video recording for monitors {:?}", monitor_ids);
@@ -36,11 +37,11 @@ pub async fn start_continuous_recording(
             .map(|&monitor_id| {
                 let db_manager_video = Arc::clone(&db);
                 let output_path_video = Arc::clone(&output_path);
-                let ocr_engine = Arc::clone(&ocr_engine);
+                let ocr_engine_clone = Arc::clone(&ocr_engine);
                 let ignored_windows_video = ignored_windows.to_vec();
                 let include_windows_video = include_windows.to_vec();
-
-                let languages = languages.clone();
+                let languages_clone = languages.clone();
+                let hide_window_texts_clone_for_task = hide_window_texts.clone();
 
                 info!("Starting video recording for monitor {}", monitor_id);
                 vision_handle.spawn(async move {
@@ -51,14 +52,15 @@ pub async fn start_continuous_recording(
                             db_manager_video.clone(),
                             output_path_video.clone(),
                             fps,
-                            ocr_engine.clone(),
+                            ocr_engine_clone.clone(),
                             monitor_id,
                             use_pii_removal,
                             &ignored_windows_video,
                             &include_windows_video,
                             video_chunk_duration,
-                            languages.clone(),
+                            languages_clone.clone(),
                             capture_unfocused_windows,
+                            hide_window_texts_clone_for_task.clone(),
                             realtime_vision,
                         )
                         .await
@@ -123,6 +125,7 @@ async fn record_video(
     video_chunk_duration: Duration,
     languages: Vec<Language>,
     capture_unfocused_windows: bool,
+    hide_window_texts: Vec<String>,
     realtime_vision: bool,
 ) -> Result<()> {
     info!("record_video: Starting for monitor {}", monitor_id);
@@ -170,6 +173,7 @@ async fn record_video(
         include_windows,
         languages,
         capture_unfocused_windows,
+        hide_window_texts.clone(),
     );
 
     info!(
@@ -237,14 +241,27 @@ async fn record_video(
 
             for window_result in &frame.window_ocr_results {
                 let insert_frame_start = std::time::Instant::now();
+
+                // Determine if this specific window_result should be hidden from pipes
+                let window_is_hidden_from_pipes = if !hide_window_texts.is_empty() {
+                    window_result.suppressed // Use the suppressed flag from the vision part
+                } else {
+                    false
+                };
+
+                if window_is_hidden_from_pipes {
+                    info!("Marking frame entry for window '{}' as hidden from pipes.", window_result.window_name);
+                }
+
                 let result = db
                     .insert_frame(
                         &device_name,
-                        None,
+                        None, // timestamp for the frame row, if different from overall CaptureResult
                         window_result.browser_url.as_deref(),
                         Some(window_result.app_name.as_str()),
                         Some(window_result.window_name.as_str()),
                         window_result.focused,
+                        window_is_hidden_from_pipes, // Pass the window-specific flag
                     )
                     .await;
 
@@ -263,50 +280,34 @@ async fn record_video(
                             frame_id,
                             insert_duration.as_millis()
                         );
-                        let text_json =
-                            serde_json::to_string(&window_result.text_json).unwrap_or_default();
-
                         let text = if use_pii_removal {
                             &remove_pii(&window_result.text)
                         } else {
                             &window_result.text
                         };
 
-                        if realtime_vision {
-                            let send_event_start = std::time::Instant::now();
-                            match send_event(
-                                "ocr_result",
-                                WindowOcr {
-                                    image: Some(frame.image.clone()),
-                                    text: text.clone(),
-                                    text_json: window_result.text_json.clone(),
-                                    app_name: window_result.app_name.clone(),
-                                    window_name: window_result.window_name.clone(),
-                                    focused: window_result.focused,
-                                    confidence: window_result.confidence,
-                                    timestamp: frame.timestamp,
-                                    browser_url: window_result.browser_url.clone(),
-                                },
-                            ) {
-                                Ok(_) => {
-                                    let event_duration = send_event_start.elapsed();
-                                    if event_duration.as_millis() > 100 {
-                                        warn!(
-                                            "Slow event sending: {}ms",
-                                            event_duration.as_millis()
-                                        );
-                                    }
-                                }
-                                Err(e) => error!("Failed to send OCR event: {}", e),
-                            }
+                        // Check if this window's OCR should be suppressed for AI/pipes
+                        let mut effective_text_for_event = text.clone();
+                        let mut effective_text_json_for_event = window_result.text_json.clone();
+
+                        if window_result.suppressed {
+                            info!(
+                                "Suppressing OCR text for window '{}' from AI/pipe event due to forbidden keyword.",
+                                window_result.window_name
+                            );
+                            effective_text_for_event = "".to_string(); // Or a placeholder like "[REDACTED]"
+                            effective_text_json_for_event = Vec::new(); // Correctly a Vec for suppression
                         }
 
                         let insert_ocr_start = std::time::Instant::now();
+                        let text_for_db = &window_result.text; // Always store original text
+                        let text_json_for_db = serde_json::to_string(&window_result.text_json).unwrap_or_default();
+
                         if let Err(e) = db
                             .insert_ocr_text(
                                 frame_id,
-                                text,
-                                &text_json,
+                                text_for_db, // Original text for DB
+                                &text_json_for_db, // Stringified original JSON for DB
                                 Arc::new((*ocr_engine).clone().into()),
                             )
                             .await
@@ -331,6 +332,37 @@ async fn record_video(
                                 frame_id,
                                 ocr_insert_duration.as_millis()
                             );
+                        }
+
+                        if realtime_vision {
+                            let send_event_start = std::time::Instant::now();
+                            match send_event(
+                                "ocr_result",
+                                WindowOcr {
+                                    image: Some(frame.image.clone()),
+                                    text: effective_text_for_event,
+                                    text_json: effective_text_json_for_event, // This is Vec<HashMap<String, String>>
+                                    app_name: window_result.app_name.clone(),
+                                    window_name: window_result.window_name.clone(),
+                                    focused: window_result.focused,
+                                    confidence: window_result.confidence,
+                                    timestamp: frame.timestamp,
+                                    browser_url: window_result.browser_url.clone(),
+                                },
+                            ) {
+                                Ok(_) => {
+                                    debug!(
+                                        "Sent OCR result to event bus in {}ms",
+                                        send_event_start.elapsed().as_millis()
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to send OCR result to event bus: {}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {

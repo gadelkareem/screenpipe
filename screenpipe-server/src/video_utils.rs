@@ -556,81 +556,195 @@ impl VideoMetadataOverride {
 
 pub async fn extract_frame_from_video(file_path: &str, offset_index: i64) -> Result<String> {
     let ffmpeg_path = find_ffmpeg_path().expect("failed to find ffmpeg path");
+    let temp_dir = tempfile::tempdir()?;
+    let output_filename = format!("frame_{}_{}.jpg", Utc::now().timestamp_nanos_opt().unwrap_or_default(), offset_index);
+    let output_pattern = temp_dir.path().join(output_filename);
 
-    let source_fps = match get_video_fps(&ffmpeg_path, file_path).await {
-        Ok(fps) => fps,
-        Err(e) => {
-            error!("failed to get video fps, using default 1fps: {}", e);
-            1.0
-        }
-    };
-
-    let offset_seconds = offset_index as f64 * source_fps;
-    let offset_str = format!("{:.3}", offset_seconds);
-
-    // Create a temporary directory for frames if it doesn't exist
-    let frames_dir = PathBuf::from("/tmp/screenpipe_frames");
-    tokio::fs::create_dir_all(&frames_dir).await?;
-
-    // Generate unique filename for the frame
-    let frame_filename = format!("frame_{}_{}.jpg", offset_index, Uuid::new_v4());
-    let output_path = frames_dir.join(&frame_filename);
+    let duration = get_video_duration(&ffmpeg_path, file_path).await.unwrap_or(0.0);
+    let offset_seconds = offset_index as f64 * (duration / get_total_frames(file_path, &ffmpeg_path).await.unwrap_or(1) as f64); // Calculate offset based on total frames if possible
+    let offset_seconds_str = format!("{:.3}", offset_seconds);
 
     debug!(
-        "extracting frame from {} at offset {} and fps {} to {}",
-        file_path,
-        offset_str,
-        source_fps,
-        output_path.display()
+        target: "ffmpeg_extract",
+        video_path = %file_path,
+        offset_index = %offset_index,
+        calculated_offset_seconds = %offset_seconds_str,
+        output_path = %output_pattern.display()
     );
 
-    let mut command = Command::new(ffmpeg_path);
+    let mut command = Command::new(&ffmpeg_path);
     command
-        .args([
-            "-ss",
-            &offset_str,
-            "-i",
-            file_path,
-            "-vf",
-            "scale=iw:ih,format=yuvj420p", // Add format conversion
-            "-vframes",
-            "1",
-            "-c:v",
-            "mjpeg",
-            "-strict",
-            "unofficial", // Add strict compliance setting
-            "-pix_fmt",
-            "yuvj420p", // Ensure proper pixel format
-            "-q:v",
-            "10",
-            "-y", // Force overwrite
-            output_path.to_str().unwrap(),
-        ])
+        .arg("-ss")
+        .arg(&offset_seconds_str)
+        .arg("-i")
+        .arg(file_path)
+        .arg("-vframes")
+        .arg("1")
+        .arg("-q:v") // for high quality
+        .arg("2") // for high quality (1-5 is good, 2 is often visually lossless for jpg)
+        .arg(output_pattern.as_os_str())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    debug!("ffmpeg command: {:?}", command);
+    info!(target: "ffmpeg_extract", "Executing ffmpeg command: {:?}", command);
 
-    let output = command.output().await?;
+    let child = command.spawn().map_err(|e| {
+        error!(target: "ffmpeg_extract", "Failed to spawn ffmpeg: {}. Command: {:?}", e, command);
+        anyhow::anyhow!("Failed to spawn ffmpeg: {}", e)
+    })?;
+
+    let output = child.wait_with_output().await.map_err(|e| {
+        error!(target: "ffmpeg_extract", "ffmpeg command failed to run: {}. Command: {:?}", e, command);
+        anyhow::anyhow!("ffmpeg command failed to run: {}", e)
+    })?;
+
+    let ffmpeg_stderr = String::from_utf8_lossy(&output.stderr);
 
     if !output.status.success() {
-        let error_message = String::from_utf8_lossy(&output.stderr);
-        info!("ffmpeg error: {}", error_message);
-        return Err(anyhow::anyhow!("ffmpeg process failed: {}", error_message));
+        error!(
+            target: "ffmpeg_extract",
+            "ffmpeg process failed. Status: {}. Stderr: {}. Command: {:?}",
+            output.status,
+            ffmpeg_stderr,
+            command
+        );
+        return Err(anyhow::anyhow!(
+            "ffmpeg process failed with status {}: {}",
+            output.status,
+            ffmpeg_stderr
+        ));
     }
 
-    if !output_path.exists() {
-        return Err(anyhow::anyhow!("failed to extract frame: file not created"));
+    if !output_pattern.exists() {
+        error!(
+            target: "ffmpeg_extract",
+            "ffmpeg command succeeded but output file was not created: {}. Stderr: {}. Command: {:?}",
+            output_pattern.display(),
+            ffmpeg_stderr,
+            command
+        );
+        return Err(anyhow::anyhow!(
+            "failed to extract frame: file not created. Stderr: {}",
+            ffmpeg_stderr
+        ));
     }
 
-    // Schedule cleanup of old frames (files older than 1 hour)
-    tokio::spawn(async move {
-        if let Err(e) = cleanup_old_frames(&frames_dir).await {
-            error!("Failed to cleanup old frames: {}", e);
+    info!(target: "ffmpeg_extract", "Successfully extracted frame to {}", output_pattern.display());
+    Ok(output_pattern.to_string_lossy().into_owned())
+}
+
+async fn get_total_frames(video_path: &str, ffmpeg_path: &Path) -> Result<i64> {
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=nb_frames")
+        .arg("-of")
+        .arg("default=nokey=1:noprint_wrappers=1")
+        .arg(video_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("ffprobe for nb_frames failed: {}", stderr));
+    }
+    let nb_frames_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if nb_frames_str == "N/A" {
+        // Fallback for streams that don't report nb_frames directly, like some live streams or weird formats
+        // Try to get duration and r_frame_rate
+        debug!(target: "ffmpeg_extract", "nb_frames is N/A for {}, trying duration/fps fallback", video_path);
+        let (duration, fps) = get_video_duration_and_fps(ffmpeg_path, video_path).await?;
+        if duration > 0.0 && fps > 0.0 {
+            return Ok((duration * fps).round() as i64);
         }
-    });
+        return Err(anyhow::anyhow!("nb_frames is N/A and could not calculate from duration/fps"));
+    }
+    nb_frames_str.parse::<i64>().map_err(anyhow::Error::from)
+}
 
-    Ok(output_path.to_string_lossy().into_owned())
+async fn get_video_duration(ffmpeg_path: &Path, video_path: &str) -> Result<f64> {
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(video_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("ffprobe for duration failed: {}", stderr));
+    }
+    let duration_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    duration_str.parse::<f64>().map_err(anyhow::Error::from)
+}
+
+async fn get_video_duration_and_fps(ffmpeg_path: &Path, video_path: &str) -> Result<(f64, f64)> {
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0") // Select only video stream
+        .arg("-show_entries")
+        .arg("stream=r_frame_rate,duration") // Get frame rate and duration
+        .arg("-of")
+        .arg("json") // Output as JSON for easier parsing
+        .arg(video_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "ffprobe for duration/fps failed: {}. Command: {:?}",
+            stderr,
+            cmd
+        ));
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let ffprobe_out: serde_json::Value = serde_json::from_str(&stdout_str).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse ffprobe JSON output: {}. Output: {}",
+            e,
+            stdout_str
+        )
+    })?;
+
+    let streams = ffprobe_out.get("streams").and_then(|s| s.as_array());
+    if let Some(streams_arr) = streams {
+        if !streams_arr.is_empty() {
+            let stream = &streams_arr[0];
+            let r_frame_rate_str = stream.get("r_frame_rate").and_then(|r| r.as_str()).unwrap_or("0/0");
+            let duration_str = stream.get("duration").and_then(|d| d.as_str());
+
+            let fps = if r_frame_rate_str.contains('/') {
+                let parts: Vec<&str> = r_frame_rate_str.split('/').collect();
+                if parts.len() == 2 {
+                    let num = parts[0].parse::<f64>().unwrap_or(0.0);
+                    let den = parts[1].parse::<f64>().unwrap_or(1.0);
+                    if den != 0.0 { num / den } else { 0.0 }
+                } else {
+                    0.0
+                }
+            } else {
+                r_frame_rate_str.parse::<f64>().unwrap_or(0.0)
+            };
+            
+            let duration = duration_str.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            return Ok((duration, fps));
+        }
+    }
+    Err(anyhow::anyhow!("Could not extract duration/fps from video: {}", video_path))
 }
 
 async fn cleanup_old_frames(frames_dir: &PathBuf) -> Result<()> {
