@@ -305,7 +305,6 @@ impl DatabaseManager {
         app_name: Option<&str>,
         window_name: Option<&str>,
         focused: bool,
-        is_hidden_from_pipes: bool, // New parameter
     ) -> Result<i64, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         debug!("insert_frame Transaction started");
@@ -342,7 +341,7 @@ impl DatabaseManager {
 
         // Insert the new frame with file_path as name and app/window metadata
         let id = sqlx::query(
-            "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, is_hidden_from_pipes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", // Added new column
+            "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(video_chunk_id)
         .bind(offset_index)
@@ -352,7 +351,7 @@ impl DatabaseManager {
         .bind(app_name)
         .bind(window_name)
         .bind(focused)
-        .bind(is_hidden_from_pipes) // Bind new parameter
+        .bind(device_name)
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
@@ -675,45 +674,33 @@ impl DatabaseManager {
         browser_url: Option<&str>,
         focused: Option<bool>,
     ) -> Result<Vec<OCRResult>, sqlx::Error> {
-        let mut conditions = Vec::new();
-        let mut args = Vec::new();
+        let mut frame_fts_parts = Vec::new();
 
-        if !query.is_empty() {
-            conditions.push("ocr_text_fts MATCH ?".to_string());
-            args.push(query.to_string());
-        }
-
-        // Always filter out hidden frames
-        conditions.push("f.is_hidden_from_pipes = FALSE".to_string());
-
-        if let Some(start) = start_time {
-            conditions.push("o.timestamp >= ?".to_string());
-            args.push(start.to_rfc3339());
-        }
-        if let Some(end) = end_time {
-            conditions.push("o.timestamp <= ?".to_string());
-            args.push(end.to_rfc3339());
-        }
         if let Some(app) = app_name {
-            conditions.push("f.app_name LIKE ?".to_string());
-            args.push(format!("%{}%", app));
+            if !app.is_empty() {
+                frame_fts_parts.push(format!("app_name:{}", app));
+            }
         }
         if let Some(window) = window_name {
-            conditions.push("f.window_name LIKE ?".to_string());
-            args.push(format!("%{}%", window));
-        }
-        if let Some(frame) = frame_name {
-            conditions.push("f.name LIKE ?".to_string());
-            args.push(format!("%{}%", frame));
+            if !window.is_empty() {
+                frame_fts_parts.push(format!("window_name:{}", window));
+            }
         }
         if let Some(browser) = browser_url {
-            conditions.push("f.browser_url LIKE ?".to_string());
-            args.push(format!("%{}%", browser));
+            if !browser.is_empty() {
+                frame_fts_parts.push(format!("browser_url:{}", browser));
+            }
         }
-        if let Some(focused) = focused {
-            conditions.push("f.focused = ?".to_string());
-            args.push(focused.to_string());
+        if let Some(is_focused) = focused {
+            frame_fts_parts.push(format!("focused:{}", if is_focused { "1" } else { "0" }));
         }
+        if let Some(frame_name) = frame_name {
+            if !frame_name.is_empty() {
+                frame_fts_parts.push(format!("name:{}", frame_name));
+            }
+        }
+
+        let frame_query = frame_fts_parts.join(" ");
 
         let sql = format!(
             r#"
@@ -728,12 +715,13 @@ impl DatabaseManager {
             frames.app_name,
             ocr_text.ocr_engine,
             frames.window_name,
+            video_chunks.device_name,
             GROUP_CONCAT(tags.name, ',') as tags,
             frames.browser_url,
             frames.focused
-        FROM frames f
-        JOIN video_chunks vc ON f.video_chunk_id = vc.id
-        JOIN ocr_text ot ON f.id = ot.frame_id
+        FROM frames
+        JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
+        JOIN ocr_text ON frames.id = ocr_text.frame_id
         LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
         LEFT JOIN tags ON vision_tags.tag_id = tags.id
         {frame_fts_join}
@@ -749,7 +737,7 @@ impl DatabaseManager {
         ORDER BY frames.timestamp DESC
         LIMIT ?7 OFFSET ?8
         "#,
-            frame_fts_join = if query.trim().is_empty() {
+            frame_fts_join = if frame_query.trim().is_empty() {
                 ""
             } else {
                 "JOIN frames_fts ON frames.id = frames_fts.id"
@@ -759,7 +747,7 @@ impl DatabaseManager {
             } else {
                 "JOIN ocr_text_fts ON ocr_text.frame_id = ocr_text_fts.frame_id"
             },
-            frame_fts_condition = if query.trim().is_empty() {
+            frame_fts_condition = if frame_query.trim().is_empty() {
                 ""
             } else {
                 "AND frames_fts MATCH ?1"
@@ -774,10 +762,10 @@ impl DatabaseManager {
         let query_builder = sqlx::query_as(&sql);
 
         let raw_results: Vec<OCRResultRaw> = query_builder
-            .bind(if query.trim().is_empty() {
+            .bind(if frame_query.trim().is_empty() {
                 None
             } else {
-                Some(&query)
+                Some(&frame_query)
             })
             .bind(start_time)
             .bind(end_time)
@@ -806,6 +794,7 @@ impl DatabaseManager {
                 app_name: raw.app_name,
                 ocr_engine: raw.ocr_engine,
                 window_name: raw.window_name,
+                device_name: raw.device_name,
                 tags: raw
                     .tags
                     .map(|t| t.split(',').map(String::from).collect())
@@ -979,6 +968,16 @@ impl DatabaseManager {
         .await
     }
 
+    pub async fn get_frame_ocr_text(&self, frame_id: i64) -> Result<Option<String>, sqlx::Error> {
+        let result = sqlx::query_as::<_, (String,)>(
+            "SELECT text FROM ocr_text WHERE frame_id = ?"
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(result.map(|r| r.0))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn count_search_results(
         &self,
@@ -1110,8 +1109,7 @@ impl DatabaseManager {
                        AND (?3 IS NULL OR frames.timestamp <= ?3)
                        AND (?4 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) >= ?4)
                        AND (?5 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) <= ?5)
-                       AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
-                       AND frames.is_hidden_from_pipes = FALSE"#,
+                       AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')"#,
                 base_table = if ocr_query.is_empty() {
                     "frames
                      JOIN ocr_text ON frames.id = ocr_text.frame_id"
@@ -2107,6 +2105,7 @@ impl DatabaseManager {
                 ocr_engine: raw.ocr_engine,
                 window_name: raw.window_name,
                 frame_name: raw.frame_name,
+                device_name: raw.device_name,
                 tags: raw
                     .tags
                     .map(|t| t.split(',').map(String::from).collect())
